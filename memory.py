@@ -4,6 +4,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from dataclasses import dataclass, field
 from typing import Literal
+from transformers import pipeline
 
 MemoryState = Literal["active", "stale", "deleted"]
 
@@ -28,6 +29,42 @@ class MemoryStore:
         self.model = SentenceTransformer(model_name)
         self.memories: list[Memory] = []
         self.embeddings: np.ndarray | None = None
+        # NLI model for contradiction detection
+        # This loads lazily on first use to keep startup fast
+        self._nli = None
+
+    def _get_nli(self):
+        """Lazy-load the NLI pipeline on first use."""
+        if self._nli is None:
+            print("Loading NLI model (one-time)...")
+            self._nli = pipeline(
+                "text-classification",
+                model="cross-encoder/nli-deberta-v3-base"
+            )
+        return self._nli
+
+    def detect_contradictions(
+        self, memories: list[Memory]
+    ) -> list[tuple[Memory, Memory, float]]:
+        """Detect pairs of memories that contradict each other.
+
+        Returns a list of (memory_a, memory_b, confidence) tuples.
+        """
+        nli = self._get_nli()
+        contradictions = []
+
+        # Check every pair
+        for i in range(len(memories)):
+            for j in range(i + 1, len(memories)):
+                m1, m2 = memories[i], memories[j]
+                result = nli(f"{m1.text} [SEP] {m2.text}")[0]
+
+                if result["label"].lower() == "contradiction":
+                    contradictions.append((m1, m2, result["score"]))
+
+        return contradictions
+
+
 
     def add(self, text: str, state: MemoryState = "active") -> Memory:
         """Add a memory and return the created Memory object."""
@@ -91,21 +128,35 @@ class MemoryStore:
 def main() -> None:
     store = MemoryStore()
 
-    # Add memories with explicit lifecycle states
     store.add_many([
         ("Alice lives at 123 Main Street.", "active"),
-        ("Alice lives at 456 Oak Avenue.", "stale"),       # she moved
-        ("Alice lives at 789 Pine Road.", "deleted"),      # typo, never true
+        ("Alice lives at 999 Lake Drive.", "active"),   # active but contradicts!
+        ("Alice lives at 456 Oak Avenue.", "stale"),
+        ("Alice lives at 789 Pine Road.", "deleted"),
         ("Alice works as a software engineer.", "active"),
         ("Alice has a dog named Max.", "active"),
-        ("Bob lives at 555 Elm Street.", "active"),
     ])
 
     query = "Where does Alice live?"
     print(f"\nQuery: {query}\n")
 
-    results = store.search(query, top_k=3)
+    # Get top results (eligibility filter applied)
+    results = store.search(query, top_k=5)
+    print("Retrieved memories:")
     for memory, score in results:
-        print(f"  {score:.3f}  [{memory.state}]  {memory.text}")
+        print(f"  {score:.3f}  {memory.text}")
+
+    # Detect contradictions
+    retrieved_memories = [m for m, _ in results]
+    contradictions = store.detect_contradictions(retrieved_memories)
+
+    print("\nDetected contradictions:")
+    if not contradictions:
+        print("  None")
+    for m1, m2, conf in contradictions:
+        print(f"  [{conf:.3f}]")
+        print(f"    {m1.text}")
+        print(f"  contradicts")
+        print(f"    {m2.text}")
 if __name__ == "__main__":
     main()
