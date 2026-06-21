@@ -124,39 +124,105 @@ class MemoryStore:
         top_indices = eligible_indices[:top_k]
 
         return [(self.memories[i], float(similarities[i])) for i in top_indices]
+    
+
+    def search_safe(
+        self, query: str, top_k: int = 3, retrieve_pool: int = 10
+    ) -> tuple[list[tuple[Memory, float]], dict]:
+        """Search with contradiction enforcement.
+
+        Returns:
+            - A list of (memory, score) tuples that are mutually consistent
+            - A "certificate" dict explaining what was retrieved, detected, and dropped
+        """
+        # Step 1: Retrieve a larger pool than top_k so we have room to drop some
+        candidates = self.search(query, top_k=retrieve_pool)
+
+        if not candidates:
+            return [], {"status": "empty", "retrieved": 0, "dropped": []}
+
+        # Step 2: Detect contradictions in the candidate pool
+        candidate_memories = [m for m, _ in candidates]
+        contradictions = self.detect_contradictions(candidate_memories)
+
+        # Step 3: Build a score lookup for quick access
+        scores = {m.memory_id: s for m, s in candidates}
+
+        # Step 4: For each contradiction, drop the lower-scored memory
+        dropped_ids = set()
+        drop_log = []
+
+        for m1, m2, conf in contradictions:
+            # Skip if one is already dropped
+            if m1.memory_id in dropped_ids or m2.memory_id in dropped_ids:
+                continue
+
+            # Drop the lower-scored one
+            if scores[m1.memory_id] >= scores[m2.memory_id]:
+                dropped_ids.add(m2.memory_id)
+                drop_log.append({
+                    "kept": m1.text,
+                    "dropped": m2.text,
+                    "reason": "contradiction",
+                    "confidence": conf,
+                })
+            else:
+                dropped_ids.add(m1.memory_id)
+                drop_log.append({
+                    "kept": m2.text,
+                    "dropped": m1.text,
+                    "reason": "contradiction",
+                    "confidence": conf,
+                })
+
+        # Step 5: Filter out dropped memories
+        safe_results = [
+            (m, s) for m, s in candidates
+            if m.memory_id not in dropped_ids
+        ]
+
+        # Trim to requested top_k
+        safe_results = safe_results[:top_k]
+
+        # Step 6: Build the certificate
+        certificate = {
+            "status": "safe",
+            "query": query,
+            "retrieved_count": len(candidates),
+            "contradictions_detected": len(contradictions),
+            "dropped_count": len(dropped_ids),
+            "returned_count": len(safe_results),
+            "drop_log": drop_log,
+        }
+
+        return safe_results, certificate
 
 def main() -> None:
     store = MemoryStore()
 
     store.add_many([
         ("Alice lives at 123 Main Street.", "active"),
-        ("Alice lives at 999 Lake Drive.", "active"),   # active but contradicts!
+        ("Alice lives at 999 Lake Drive.", "active"),     # contradicts current
         ("Alice lives at 456 Oak Avenue.", "stale"),
         ("Alice lives at 789 Pine Road.", "deleted"),
         ("Alice works as a software engineer.", "active"),
         ("Alice has a dog named Max.", "active"),
+        ("Bob lives at 555 Elm Street.", "active"),
     ])
 
     query = "Where does Alice live?"
     print(f"\nQuery: {query}\n")
 
-    # Get top results (eligibility filter applied)
-    results = store.search(query, top_k=5)
-    print("Retrieved memories:")
+    # Use the safe search
+    results, certificate = store.search_safe(query, top_k=3)
+
+    print("Safe results:")
     for memory, score in results:
         print(f"  {score:.3f}  {memory.text}")
 
-    # Detect contradictions
-    retrieved_memories = [m for m, _ in results]
-    contradictions = store.detect_contradictions(retrieved_memories)
-
-    print("\nDetected contradictions:")
-    if not contradictions:
-        print("  None")
-    for m1, m2, conf in contradictions:
-        print(f"  [{conf:.3f}]")
-        print(f"    {m1.text}")
-        print(f"  contradicts")
-        print(f"    {m2.text}")
+    print("\nCertificate:")
+    import json
+    print(json.dumps(certificate, indent=2))
+    
 if __name__ == "__main__":
     main()
