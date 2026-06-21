@@ -2,81 +2,110 @@
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from dataclasses import dataclass, field
+from typing import Literal
 
+MemoryState = Literal["active", "stale", "deleted"]
+
+
+@dataclass
+class Memory:
+    """A memory object with content and lifecycle state."""
+    text: str
+    state: MemoryState = "active"
+    memory_id: str = ""  # we'll use this later
+
+    def __post_init__(self):
+        if not self.memory_id:
+            # Generate a simple ID if not provided
+            import uuid
+            self.memory_id = f"mem_{uuid.uuid4().hex[:8]}"
 
 class MemoryStore:
-    """Stores text memories and retrieves them by semantic similarity."""
+    """Stores Memory objects and retrieves them by semantic similarity."""
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         self.model = SentenceTransformer(model_name)
-        self.memories: list[str] = []
+        self.memories: list[Memory] = []
         self.embeddings: np.ndarray | None = None
 
-    def add(self, text: str) -> None:
-        """Add a new memory to the store."""
-        self.memories.append(text)
+    def add(self, text: str, state: MemoryState = "active") -> Memory:
+        """Add a memory and return the created Memory object."""
+        memory = Memory(text=text, state=state)
+        self.memories.append(memory)
         self._reindex()
+        return memory
 
-    def add_many(self, texts: list[str]) -> None:
-        """Add multiple memories efficiently."""
-        self.memories.extend(texts)
+    def add_many(self, items: list[tuple[str, MemoryState]]) -> list[Memory]:
+        """Add multiple memories. Each item is (text, state)."""
+        created = [Memory(text=t, state=s) for t, s in items]
+        self.memories.extend(created)
         self._reindex()
+        return created
+
+    def mark_deleted(self, memory_id: str) -> bool:
+        """Mark a memory as deleted by ID."""
+        for m in self.memories:
+            if m.memory_id == memory_id:
+                m.state = "deleted"
+                return True
+        return False
 
     def _reindex(self) -> None:
-        """Recompute all embeddings (called after adding)."""
         if not self.memories:
             self.embeddings = None
             return
-        raw = self.model.encode(self.memories)
-        # Normalize for cosine similarity
+        texts = [m.text for m in self.memories]
+        raw = self.model.encode(texts)
         self.embeddings = raw / np.linalg.norm(raw, axis=1, keepdims=True)
 
-    def search(self, query: str, top_k: int = 3) -> list[tuple[str, float]]:
-        """Find the top_k most similar memories to the query."""
+    def search(self, query: str, top_k: int = 3) -> list[tuple[Memory, float]]:
+        """Find top_k most similar ELIGIBLE memories to the query.
+
+        Eligibility = state is 'active'. Deleted and stale memories
+        are filtered out before ranking.
+        """
         if self.embeddings is None:
             return []
 
         query_emb = self.model.encode([query])[0]
         query_emb = query_emb / np.linalg.norm(query_emb)
 
+        # Compute similarities for all memories
         similarities = self.embeddings @ query_emb
-        top_indices = np.argsort(similarities)[::-1][:top_k]
+
+        # Filter to only eligible (active) memories
+        eligible_indices = [
+            i for i, m in enumerate(self.memories)
+            if m.state == "active"
+        ]
+
+        # Sort eligible indices by similarity (descending)
+        eligible_indices.sort(key=lambda i: similarities[i], reverse=True)
+
+        # Take top_k
+        top_indices = eligible_indices[:top_k]
 
         return [(self.memories[i], float(similarities[i])) for i in top_indices]
-    def remove(self, text: str) -> bool:
-        """Remove a memory. Returns True if found and removed."""
-        if text in self.memories:
-            self.memories.remove(text)
-            self._reindex()
-            return True
-        return False
 
 def main() -> None:
     store = MemoryStore()
+
+    # Add memories with explicit lifecycle states
     store.add_many([
-        "2",
-        "Python is a programming language used widely in research.",
-        "The MemGov paper introduces a governance layer for agent memory.",
-        "Pretrained language models include GPT, Claude, and Gemini.",
-        "Embeddings are vectors representing the meaning of text.",
+        ("Alice lives at 123 Main Street.", "active"),
+        ("Alice lives at 456 Oak Avenue.", "stale"),       # she moved
+        ("Alice lives at 789 Pine Road.", "deleted"),      # typo, never true
+        ("Alice works as a software engineer.", "active"),
+        ("Alice has a dog named Max.", "active"),
+        ("Bob lives at 555 Elm Street.", "active"),
     ])
 
-    queries = [
-        "What is 1+1?",
-        "What is the research paper about?",
-        "How do AI models understand language?",
-    ]
+    query = "Where does Alice live?"
+    print(f"\nQuery: {query}\n")
 
-    for q in queries:
-        print(f"\nQuery: {q}")
-        for memory, score in store.search(q, top_k=2):
-            print(f"  {score:.3f}  {memory}")
-    print("\nRemoving Python memory...")
-    store.remove("Python is a programming language used widely in research.")
-    print("\nQuery: programming languages")
-    for memory, score in store.search("programming languages", top_k=3):
-        print(f"  {score:.3f}  {memory}")
-
-
+    results = store.search(query, top_k=3)
+    for memory, score in results:
+        print(f"  {score:.3f}  [{memory.state}]  {memory.text}")
 if __name__ == "__main__":
     main()
