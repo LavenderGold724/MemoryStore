@@ -43,7 +43,13 @@ class MemoryStore:
         top_indices = np.argsort(similarities)[::-1][:top_k]
 
         return [(self.memories[i], float(similarities[i])) for i in top_indices]
-
+    def remove(self, text: str) -> bool:
+        """Remove a memory. Returns True if found and removed."""
+        if text in self.memories:
+            self.memories.remove(text)
+            self._reindex()
+            return True
+        return False
 
 def main() -> None:
     store = MemoryStore()
@@ -65,6 +71,11 @@ def main() -> None:
         print(f"\nQuery: {q}")
         for memory, score in store.search(q, top_k=2):
             print(f"  {score:.3f}  {memory}")
+    print("\nRemoving Python memory...")
+    store.remove("Python is a programming language used widely in research.")
+    print("\nQuery: programming languages")
+    for memory, score in store.search("programming languages", top_k=3):
+        print(f"  {score:.3f}  {memory}")
 
 
 if __name__ == "__main__":
